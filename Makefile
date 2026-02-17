@@ -24,7 +24,6 @@ install: build
 	sudo cp ${curpwd}/${kver}/nct6687.ko /lib/modules/${kver}/kernel/drivers/hwmon/
 	sudo depmod
 	sudo modprobe nct6687
-
 clean:
 	[ -d "${curpwd}/${kver}" ] && make -C /lib/modules/${kver}/build M=${curpwd}/${kver} $(LLVM_FLAGS) clean
 
