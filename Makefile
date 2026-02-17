@@ -20,7 +20,6 @@ build:
 	cd ${curpwd}/${kver}
 	make -C /lib/modules/${kver}/build M=${curpwd}/${kver} $(LLVM_FLAGS) modules
 install: build
-	sudo dkms remove nct6687d/1 --all
 	sudo cp ${curpwd}/${kver}/nct6687.ko /lib/modules/${kver}/kernel/drivers/hwmon/
 	sudo depmod
 	sudo modprobe nct6687
