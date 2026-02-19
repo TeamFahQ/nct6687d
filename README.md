@@ -111,6 +111,9 @@ Just add nct6687 into /etc/modules
 
 ### Arch-Linux with systemd
 
+[See entry in the Arch Wiki](https://wiki.archlinux.org/title/Lm_sensors#MSI_MAG_B650_/_Z890_TOMAHAWK_WIFI_(MS-7D75/MS-7E32)_/_MAG_B550_MORTAR_WIFI_(MS-7C94))
+
+
 `sudo sh -c 'echo "nct6687" >> /etc/modules-load.d/nct6687.conf'`
 
 <br>
