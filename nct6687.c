@@ -389,7 +389,7 @@ enum nct6687_fan_config_type
  * Based on LibreHardwareMonitor NCT6687DR chip detection:
  * https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/blob/master/LibreHardwareMonitorLib/Hardware/Motherboard/Lpc/LpcIO.cs
  */
-static const struct dmi_system_id nct6687_msi_alt_boards[] __initconst = {
+static const struct dmi_system_id nct6687_msi_alt_boards[] = {
 	// B840 Series
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "PRO B840-P WIFI (MS-7E57)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "B840M GAMING PLUS WIFI6E (MS-7E77)")}},
