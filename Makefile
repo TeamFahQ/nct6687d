@@ -30,7 +30,7 @@ akmod/build:
 		echo "Fedora version $(fedoraver) is greater than 40, using dnf5 command"; \
 		sudo dnf install -y @development-tools; \
 	else \
-		sudo dnf groupinstall -y "Development Tools"; \
+		sudo dnf group install -y "Development Tools" --skip-unavailable; \
 	fi
 	sudo dnf install -y rpmdevtools kmodtool
 	mkdir -p ${curpwd}/.tmp/nct6687d-1.0.${commitcount}/nct6687d
