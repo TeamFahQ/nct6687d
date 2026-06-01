@@ -37,6 +37,7 @@
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 
 #define DRVNAME "nct6687"
 
@@ -75,12 +76,36 @@ enum kinds
 	nct6687
 };
 
+/*
+ * pwm*_enable values follow the hwmon ABI defined in
+ * Documentation/ABI/testing/sysfs-class-hwmon:
+ *
+ *   1  - manual fan speed control (write pwm*)
+ *   2+ - automatic fan speed control
+ *
+ * NCT668x exposes several automatic profiles internally; this driver
+ * does not currently let userspace pick between them, so 2 simply means
+ * "clear the manual-control bit" and the EC continues running whichever
+ * profile firmware configured.
+ *
+ * The driver previously reported 99 for the auto state and rejected any
+ * write other than 1 or 99. That made standard userspace (lm-sensors
+ * `fancontrol`, ventd, etc.) trip on `-EINVAL` when restoring auto mode
+ * on shutdown. Both values are now accepted in store_pwm_enable;
+ * show_pwm_enable always returns the ABI-conforming 1 or 2.
+ */
 enum pwm_enable
 {
 	manual_mode = 1,
-	// There are multiple automatic modes, none of which is configurable by this module yet.
-	firmware_mode = 99,
+	auto_mode = 2,
 };
+
+/*
+ * Legacy auto-mode value historically reported / accepted by this
+ * driver. Still accepted in store_pwm_enable for callers that scripted
+ * around the old behaviour; never reported in show_pwm_enable.
+ */
+#define NCT6687_LEGACY_AUTO_MODE 99
 
 static bool force;
 static bool manual;
@@ -495,7 +520,22 @@ static const struct kernel_param_ops nct6687_fan_config_op_ops = {
 	.set = nct6687_fan_config_op_write_handler,
 	.get = nct6687_fan_config_op_read_handler};
 
-module_param_cb(fan_config, &nct6687_fan_config_op_ops, NULL, 0660);
+/*
+ * fan_config is intentionally a boot-time parameter only (perm 0440 —
+ * world-readable, not writable from sysfs). nct6687_fan_config_active
+ * is a globally-shared pointer that sysfs reader paths dereference
+ * lock-free for every fan/pwm access; allowing runtime writes via
+ * `echo msi_alt1 > /sys/module/nct6687/parameters/fan_config` races
+ * those readers and can produce torn pointer reads on 32-bit hosts
+ * and stale register addresses mid-EC-transaction on 64-bit hosts.
+ *
+ * The .set callback is still wired up because the kernel param core
+ * calls it for `insmod nct6687.ko fan_config=msi_alt1` at module load
+ * time, which is the only point at which switching the active config
+ * is safe (before the platform_device is probed and before any reader
+ * exists).
+ */
+module_param_cb(fan_config, &nct6687_fan_config_op_ops, NULL, 0440);
 
 /* ------------------------------------------------------- */
 struct nct6687_data
@@ -512,8 +552,13 @@ struct nct6687_data
 	bool valid;					/* true if following fields are valid */
 	unsigned long last_updated; /* In jiffies */
 
-	/* Voltage values */
-	s16 voltage[3][NCT6687_NUM_REG_VOLTAGE]; // 0 = current 1 = min 2 = max
+	/*
+	 * Voltage values in mV (hwmon ABI). s32 rather than s16 because a
+	 * 12-bit raw reading multiplied by the +12V definition's multiplier
+	 * of 12 peaks around 49140 mV — past the 32767 ceiling of s16.
+	 * Index 0 = current, 1 = running min, 2 = running max.
+	 */
+	s32 voltage[3][NCT6687_NUM_REG_VOLTAGE];
 
 	/* Temperature values */
 	s32 temperature[3][NCT6687_NUM_REG_TEMP]; // 0 = current 1 = min 2 = max
@@ -691,12 +736,22 @@ static u16 nct6687_read(struct nct6687_data *data, u16 address)
 	u8 page = (u8)(address >> 8);
 	u8 index = (u8)(address & 0xFF);
 	int res;
+
+	/*
+	 * EC access is a page-select + index-set + data-read sequence on a
+	 * shared 4-byte I/O window. The data read MUST be inside the lock
+	 * with the matching page/index writes — otherwise a concurrent
+	 * nct6687_read() or nct6687_write() from another thread can
+	 * reprogram page/index between our writes and our inb_p, and we
+	 * return data for the wrong register. nct6687_write() already
+	 * holds the lock across its data write; do the same here.
+	 */
 	mutex_lock(&data->EC_io_lock);
 	outb_p(EC_SPACE_PAGE_SELECT, data->addr + EC_SPACE_PAGE_REGISTER_OFFSET);
 	outb_p(page, data->addr + EC_SPACE_PAGE_REGISTER_OFFSET);
 	outb_p(index, data->addr + EC_SPACE_INDEX_REGISTER_OFFSET);
-	mutex_unlock(&data->EC_io_lock);
 	res = inb_p(data->addr + EC_SPACE_DATA_REGISTER_OFFSET);
+	mutex_unlock(&data->EC_io_lock);
 
 	return res;
 }
@@ -775,7 +830,12 @@ static void nct6687_update_voltage(struct nct6687_data *data)
 		s16 high = nct6687_read(data, NCT6687_REG_VOLTAGE(reg)) * 16;
 		s16 low = ((u16)nct6687_read(data, NCT6687_REG_VOLTAGE(reg) + 1)) >> 4;
 		s16 value = low + high;
-		s16 voltage = manual ? value : value * nct6687_voltage_definition[index].multiplier;
+		/*
+		 * value (max 4095) * multiplier (12 for +12V rail) reaches
+		 * ~49140 mV, which overflows s16. Use s32 to keep rail values
+		 * correct under worst-case inputs.
+		 */
+		s32 voltage = manual ? value : value * nct6687_voltage_definition[index].multiplier;
 
 		data->voltage[0][index] = voltage;
 		data->voltage[1][index] = MIN(voltage, data->voltage[1][index]);
@@ -794,7 +854,7 @@ static enum pwm_enable nct6687_get_pwm_enable(struct nct6687_data *data, int ind
 	{
 		return manual_mode;
 	}
-	return firmware_mode;
+	return auto_mode;
 }
 
 static void nct6687_update_fans(struct nct6687_data *data)
@@ -1146,7 +1206,7 @@ static ssize_t store_pwm_enable(struct device *dev, struct device_attribute *att
 
 	if (index >= NCT6687_NUM_REG_FAN || kstrtoul(buf, 10, &val))
 		return -EINVAL;
-	if (val != manual_mode && val != firmware_mode)
+	if (val != manual_mode && val != auto_mode && val != NCT6687_LEGACY_AUTO_MODE)
 		return -EINVAL;
 
 	mutex_lock(&data->update_lock);
@@ -1160,12 +1220,21 @@ static ssize_t store_pwm_enable(struct device *dev, struct device_attribute *att
 	{
 		mode = (u8)(mode | bitMask);
 	}
-	else if (val == firmware_mode)
+	else
 	{
+		/* auto_mode or NCT6687_LEGACY_AUTO_MODE — clear the manual-control bit. */
 		mode = (u8)(mode & ~bitMask);
 	}
 
 	nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
+
+	/*
+	 * Keep the cached pwm_enable consistent with the register we just wrote
+	 * so the immediate read-back returns the value the user just stored,
+	 * not the previous value cached on the last nct6687_update_device tick.
+	 * Legacy value 99 is normalised to the ABI-conforming auto_mode (2).
+	 */
+	data->pwm_enable[index] = (val == manual_mode) ? manual_mode : auto_mode;
 
 	mutex_unlock(&data->update_lock);
 
@@ -1295,7 +1364,7 @@ static void nct6687_setup_voltages(struct nct6687_data *data)
 		s16 high = nct6687_read(data, NCT6687_REG_VOLTAGE(reg)) * 16;
 		s16 low = ((u16)nct6687_read(data, NCT6687_REG_VOLTAGE(reg) + 1)) >> 4;
 		s16 value = low + high;
-		s16 voltage = manual ? value : value * nct6687_voltage_definition[index].multiplier;
+		s32 voltage = manual ? value : value * nct6687_voltage_definition[index].multiplier;
 
 		data->voltage[0][index] = voltage;
 		data->voltage[1][index] = voltage;
@@ -1313,7 +1382,7 @@ static void nct6687_setup_temperatures(struct nct6687_data *data)
 	{
 		s32 value = (char)nct6687_read(data, NCT6687_REG_TEMP(i));
 		s32 half = (nct6687_read(data, NCT6687_REG_TEMP(i) + 1) >> 7) & 0x1;
-		s32 temperature = (value * 1000) + (5 * half);
+		s32 temperature = (value * 1000) + (500 * half);
 
 		data->temperature[0][i] = temperature;
 		data->temperature[1][i] = temperature;
@@ -1342,7 +1411,22 @@ static void nct6687_setup_pwm(struct nct6687_data *data)
 	}
 }
 
+/*
+ * platform_driver.remove's signature changed from
+ *   int  (*remove)(struct platform_device *)
+ * to
+ *   void (*remove)(struct platform_device *)
+ * in 6.11 (kernel commit 0edb555a6).
+ *
+ * Conditionally compile the signature so we can drop the
+ * -Wincompatible-pointer-types pragma from around the
+ * platform_driver struct.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 static int nct6687_remove(struct platform_device *pdev)
+#else
+static void nct6687_remove(struct platform_device *pdev)
+#endif
 {
 	struct device *dev = &pdev->dev;
 	struct nct6687_data *data = dev_get_drvdata(dev);
@@ -1357,7 +1441,9 @@ static int nct6687_remove(struct platform_device *pdev)
 
 	mutex_unlock(&data->update_lock);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 	return 0;
+#endif
 }
 
 static int nct6687_probe(struct platform_device *pdev)
@@ -1455,9 +1541,9 @@ static int nct6687_probe(struct platform_device *pdev)
 	return PTR_ERR_OR_ZERO(hwmon_dev);
 }
 
-static int nct6687_suspend(struct platform_device *pdev, pm_message_t state)
+static int nct6687_suspend(struct device *dev)
 {
-	struct nct6687_data *data = nct6687_update_device(&pdev->dev);
+	struct nct6687_data *data = nct6687_update_device(dev);
 
 	mutex_lock(&data->update_lock);
 	data->hwm_cfg = nct6687_read(data, NCT6687_HWM_CFG);
@@ -1466,9 +1552,8 @@ static int nct6687_suspend(struct platform_device *pdev, pm_message_t state)
 	return 0;
 }
 
-static int nct6687_resume(struct platform_device *pdev)
+static int nct6687_resume(struct device *dev)
 {
-	struct device *dev = &pdev->dev;
 	struct nct6687_data *data = dev_get_drvdata(dev);
 
 	mutex_lock(&data->update_lock);
@@ -1482,17 +1567,17 @@ static int nct6687_resume(struct platform_device *pdev)
 	return 0;
 }
 
-// static const struct dev_pm_ops nct6687_dev_pm_ops = {
-// 	.suspend = nct6687_suspend,
-// 	.resume = nct6687_resume,
-// 	.freeze = nct6687_suspend,
-// 	.restore = nct6687_resume,
-// };
+/*
+ * Sleep PM ops registered via .driver.pm. The platform_driver.suspend
+ * / .resume slots are deprecated; .driver.pm is the modern dispatch
+ * path in platform_pm_suspend / platform_pm_resume.
+ * SIMPLE_DEV_PM_OPS also wires freeze/thaw and poweroff/restore, so
+ * hibernate uses the same handlers as S3.
+ */
+static SIMPLE_DEV_PM_OPS(nct6687_dev_pm_ops, nct6687_suspend, nct6687_resume);
 
-#define NCT6687_DEV_PM_OPS NULL
+#define NCT6687_DEV_PM_OPS (&nct6687_dev_pm_ops)
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
 static struct platform_driver nct6687_driver = {
 	.driver = {
 		.name = DRVNAME,
@@ -1500,10 +1585,7 @@ static struct platform_driver nct6687_driver = {
 	},
 	.probe = nct6687_probe,
 	.remove = nct6687_remove,
-	.suspend = nct6687_suspend,
-	.resume = nct6687_resume,
 };
-#pragma GCC diagnostic pop
 
 static int __init nct6687_find(int sioaddr, struct nct6687_sio_data *sio_data)
 {
@@ -1534,6 +1616,30 @@ static int __init nct6687_find(int sioaddr, struct nct6687_sio_data *sio_data)
 	default:
 		if (force)
 		{
+			/*
+			 * Only allow force=1 on chips whose ID is plausibly in the
+			 * Nuvoton NCT668x family (upper nibble 0xD). Other vendors'
+			 * SuperIOs — ITE IT87xx at 0x87xx, Fintek F71xxx at 0x07xx,
+			 * even Nuvoton's own NCT677x at 0xc8xx-0xc9xx — use
+			 * completely different register maps. Forcing the NCT6687
+			 * map onto them at minimum produces nonsense readings and
+			 * at worst writes to unknown control bits that can leave
+			 * the EC in a state the BIOS can no longer recover.
+			 *
+			 * If you reach this branch the right move is usually to
+			 * add the chip ID to the explicit switch above, after
+			 * verifying the register map matches; force is meant for
+			 * experimentation with brand-new NCT668x variants, not
+			 * for cross-vendor attachment.
+			 */
+			if ((val & 0xF000) != 0xD000)
+			{
+				pr_warn("force=1 refused: chip ID 0x%04x is outside the Nuvoton NCT668x range (0xD000-0xDFFF); attach the vendor-appropriate driver instead\n",
+					val);
+				goto fail;
+			}
+			pr_warn("force=1: attaching nct6687 to unrecognised chip ID 0x%04x in the NCT668x range — readings may be incorrect, please file a support request with the board's DMI info\n",
+				val);
 			sio_data->kind = nct6687;
 			break;
 		}
@@ -1705,6 +1811,7 @@ static void __exit sensors_nct6687_exit(void)
 MODULE_AUTHOR("Frederic Boltz <frederic.boltz@gmail.com>");
 MODULE_DESCRIPTION("Driver for NCT6687D");
 MODULE_LICENSE("GPL");
+MODULE_VERSION("1.0.0");
 
 module_init(sensors_nct6687_init);
 module_exit(sensors_nct6687_exit);
