@@ -440,6 +440,9 @@ static const struct dmi_system_id nct6687_msi_alt_boards[] = {
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "B850MPOWER (MS-7E83)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "PRO B850-S WIFI6E (MS-7E80)")}},
 
+        // B860 Series
+        {.matches = {DMI_MATCH(DMI_BOARD_NAME, "MAG B860M MORTAR WIFI (MS-7E40)")}},
+
 	// X870 Series
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "X870 GAMING PLUS WIFI (MS-7E47)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "X870E GAMING PLUS WIFI (MS-7E70)")}},
