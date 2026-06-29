@@ -477,7 +477,7 @@ static int nct6687_fan_config_op_write_handler(const char *val, const struct ker
 	char valcp[16];
 	char *s;
 
-	strncpy(valcp, val, 16);
+	strscpy(valcp, val, 16);
 	valcp[15] = '\0';
 
 	s = strstrip(valcp);
